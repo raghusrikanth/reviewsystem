@@ -1,0 +1,21 @@
+# Maven
+/target/
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Misc
+*.swp
+*.swo
+
+# Exclude sensitive config (if any)
+# src/main/resources/application-prod.yml 
