@@ -32,6 +32,7 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.*;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.*;
 
 @Service
 @RequiredArgsConstructor
@@ -160,18 +161,42 @@ public class ReviewImportService {
             logger.info("No new .jl files to be processed in {}", folderPath);
             return;
         }
+        int threads = folderConfig.getConcurrentThreads();
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        List<Future<?>> futures = new java.util.ArrayList<>();
         for (File file : files) {
-            logger.info("Processing JL file: {}", file.getAbsolutePath());
-            parseAndImportJLFile(file.getAbsolutePath());
-            // Rename file to _processed.jl
-            String newName = file.getAbsolutePath().replaceFirst("\\.jl$", "_processed.jl");
-            try {
-                Files.move(file.toPath(), Path.of(newName), StandardCopyOption.REPLACE_EXISTING);
-                logger.info("Renamed file to {}", newName);
-            } catch (Exception e) {
-                logger.error("Failed to rename file {}: {}", file.getAbsolutePath(), e.getMessage());
-            }
+            futures.add(executor.submit(() -> {
+                String filePath = file.getAbsolutePath();
+                String newName = filePath.replaceFirst("\\.jl$", "_processed.jl");
+                String threadName = Thread.currentThread().getName();
+                logger.info("[{}] Attempting to pick file for processing: {}", threadName, filePath);
+                // Use atomic rename to prevent double processing
+                boolean renamed = file.renameTo(new File(newName + ".processing"));
+                if (!renamed) {
+                    logger.warn("[{}] Could not lock file for processing (maybe already processing?): {}", threadName, filePath);
+                    return;
+                }
+                File processingFile = new File(newName + ".processing");
+                try {
+                    logger.info("[{}] Picked and processing JL file: {}", threadName, processingFile.getAbsolutePath());
+                    parseAndImportJLFile(processingFile.getAbsolutePath());
+                    // Rename to _processed.jl after successful processing
+                    File finalFile = new File(newName);
+                    if (!processingFile.renameTo(finalFile)) {
+                        logger.error("[{}] Failed to rename file {} to {} after processing", threadName, processingFile.getAbsolutePath(), finalFile.getAbsolutePath());
+                    } else {
+                        logger.info("[{}] Renamed file to {}", threadName, finalFile.getAbsolutePath());
+                    }
+                } catch (Exception e) {
+                    logger.error("[{}] Failed to process file {}: {}", threadName, processingFile.getAbsolutePath(), e.getMessage());
+                    // Optionally, rename back to original if needed
+                }
+            }));
         }
+        for (Future<?> f : futures) {
+            try { f.get(); } catch (Exception e) { logger.error("Error in file processing thread: {}", e.getMessage()); }
+        }
+        executor.shutdown();
     }
 
     public void importJLFiles() {
@@ -186,6 +211,9 @@ public class ReviewImportService {
     void s3ProcessJLFiles() {
         String bucket = s3Config.getBucket();
         String prefix = s3Config.getPrefix();
+        int threads = folderConfig.getConcurrentThreads();
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        List<Future<?>> futures = new java.util.ArrayList<>();
         try (S3Client s3 = S3Client.builder()
                 .region(Region.of(s3Config.getRegion()))
                 .credentialsProvider(StaticCredentialsProvider.create(
@@ -200,45 +228,74 @@ public class ReviewImportService {
             boolean found = false;
             for (S3Object obj : listRes.contents()) {
                 String key = obj.key();
-                if (key.endsWith(".jl") && !key.endsWith("_processed.jl")) {
+                if (key.endsWith(".jl") && !key.endsWith("_processed.jl") && !key.endsWith(".processing")) {
                     found = true;
-                    logger.info("Processing S3 JL file: {}", key);
-                    // Download to temp file (use configurable dir)
-                    String tempDirPath = folderConfig.getTempDir();
-                    Path tempFile;
-                    if (tempDirPath != null && !tempDirPath.isBlank()) {
-                        File tempDir = new File(tempDirPath);
-                        if (!tempDir.exists()) tempDir.mkdirs();
-                        tempFile = Files.createTempFile(tempDir.toPath(), "s3jl_", ".jl");
-                    } else {
-                        tempFile = Files.createTempFile("s3jl_", ".jl");
-                    }
-                    logger.info("bukket:  {},  key : {}, prefix: {}", bucket, key, prefix) ;
-                    GetObjectRequest getReq = GetObjectRequest.builder().bucket(bucket).key(key).build();
-                    try (software.amazon.awssdk.core.ResponseInputStream<software.amazon.awssdk.services.s3.model.GetObjectResponse> s3is = s3.getObject(getReq)) {
-                        Files.copy(s3is, tempFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                    }
-                    logger.info("Downloaded S3 file: {} to {} (size: {} bytes)", key, tempFile, Files.size(tempFile));
-                    // Process
-                    parseAndImportJLFile(tempFile.toAbsolutePath().toString());
-                    // Rename/move in S3
-                    String newKey = key.replaceFirst("\\.jl$", "_processed.jl");
-                    CopyObjectRequest copyReq = CopyObjectRequest.builder()
-                            .sourceBucket(bucket)
-                            .sourceKey(key)
-                            .destinationBucket(bucket)
-                            .destinationKey(newKey)
-                            .build();
-                    s3.copyObject(copyReq);
-                    s3.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(key).build());
-                    logger.info("Renamed S3 file to {}", newKey);
-                    // Delete temp file
-                    Files.deleteIfExists(tempFile);
+                    futures.add(executor.submit(() -> {
+                        String threadName = Thread.currentThread().getName();
+                        logger.info("[{}] Attempting to pick S3 file for processing: {}", threadName, key);
+                        String processingKey = key.replaceFirst("\\.jl$", ".processing");
+                        // Try to move (rename) the file to .processing as a distributed lock
+                        try {
+                            CopyObjectRequest copyToProcessing = CopyObjectRequest.builder()
+                                .sourceBucket(bucket)
+                                .sourceKey(key)
+                                .destinationBucket(bucket)
+                                .destinationKey(processingKey)
+                                .build();
+                            s3.copyObject(copyToProcessing);
+                            s3.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(key).build());
+                            logger.info("[{}] Renamed S3 file {} to {} for processing", threadName, key, processingKey);
+                        } catch (Exception e) {
+                            logger.warn("[{}] Could not lock S3 file for processing (maybe already processing?): {}", threadName, key);
+                            return;
+                        }
+                        // Now process the .processing file
+                        String tempDirPath = folderConfig.getTempDir();
+                        Path tempFile;
+                        try {
+                            if (tempDirPath != null && !tempDirPath.isBlank()) {
+                                File tempDir = new File(tempDirPath);
+                                if (!tempDir.exists()) tempDir.mkdirs();
+                                tempFile = Files.createTempFile(tempDir.toPath(), "s3jl_", ".jl");
+                            } else {
+                                tempFile = Files.createTempFile("s3jl_", ".jl");
+                            }
+                            logger.info("[{}] bukket:  {},  key : {}, prefix: {}", threadName, bucket, processingKey, prefix);
+                            GetObjectRequest getReq = GetObjectRequest.builder().bucket(bucket).key(processingKey).build();
+                            try (software.amazon.awssdk.core.ResponseInputStream<software.amazon.awssdk.services.s3.model.GetObjectResponse> s3is = s3.getObject(getReq)) {
+                                Files.copy(s3is, tempFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                            }
+                            logger.info("[{}] Downloaded S3 file: {} to {} (size: {} bytes)", threadName, processingKey, tempFile, Files.size(tempFile));
+                            // Process
+                            logger.info("[{}] Picked and processing S3 JL file: {}", threadName, tempFile.toAbsolutePath());
+                            parseAndImportJLFile(tempFile.toAbsolutePath().toString());
+                            // Rename/move in S3 to _processed.jl
+                            String processedKey = key.replaceFirst("\\.jl$", "_processed.jl");
+                            CopyObjectRequest copyToProcessed = CopyObjectRequest.builder()
+                                .sourceBucket(bucket)
+                                .sourceKey(processingKey)
+                                .destinationBucket(bucket)
+                                .destinationKey(processedKey)
+                                .build();
+                            s3.copyObject(copyToProcessed);
+                            s3.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(processingKey).build());
+                            logger.info("[{}] Renamed S3 file {} to {} after processing", threadName, processingKey, processedKey);
+                            // Delete temp file
+                            Files.deleteIfExists(tempFile);
+                        } catch (Exception e) {
+                            logger.error("[{}] Error processing S3 JL file {}: {}", threadName, processingKey, e.getMessage());
+                            // Optionally, move back to original name or leave as .processing for manual inspection
+                        }
+                    }));
                 }
             }
             if (!found) {
                 logger.info("No new .jl files to be processed in S3 bucket {}/{}", bucket, prefix);
             }
+            for (Future<?> f : futures) {
+                try { f.get(); } catch (Exception e) { logger.error("Error in S3 file processing thread: {}", e.getMessage()); }
+            }
+            executor.shutdown();
         } catch (Exception e) {
             logger.error("Error processing JL files from S3", e);
         }

@@ -1,5 +1,6 @@
 package com.reviewsystem.model;
 
+import com.fasterxml.jackson.annotation.JsonBackReference;
 import jakarta.persistence.*;
 import lombok.*;
 import java.time.LocalDateTime;
@@ -21,6 +22,7 @@ public class ReviewGrades {
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "review_id")
+    @JsonBackReference
     private Review review;
 
     private String category;

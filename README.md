@@ -5,6 +5,7 @@ Review System Microservice that retrieves Agoda.com / Booking.com / Expedia revi
 ## **Features**
 
 - Import reviews from AWS S3 or local folder (configurable)
+- Concurrent file processing based on threads configured.
 - Batch insert for high performance (configurable batch size)
 - Error handling and logging (Log4j2)
 - Idempotent processing (skips already-processed files), by renaming them to processed
@@ -12,6 +13,30 @@ Review System Microservice that retrieves Agoda.com / Booking.com / Expedia revi
 - REST API and command-line triggers
 - Extensible, normalized MySQL schema
 - Docker-ready, all config via environment variables
+
+---
+
+## **Assumptions**
+
+- All data is imported from single source, either same S3 bucket and folder. we can extend this in future if required
+- User names are masked in sample file, but in real time we get displayMemberName will be populated or we can get ID for user. For now assumed displayMemberName as unique user.
+- Assuming Database will support Unicode.
+- We don't need Authentication for now.
+- ***
+
+## **Design Decisions**
+
+- Spring Boot & Java 17: Chosen for raid development, but we can do this any other language like python.
+- Config-Driven Import: Import source details are in application.yml and can be overwritten using environment variables in container deployment.
+- Batch Processing: Reviews, grades, and overall-by-provider records are inserted into the database in configurable batches (default: 25). This improves performance by reducing the number of database round-trips and transaction overhead. If a batch insert fails, the system automatically falls back to inserting records individually, ensuring that a single bad record does not block the import of others. The batch size is configurable via `application.yml` or environment variables, allowing tuning for different database capacities and workloads.
+- Master data adding: User table, hotel table and provider table will be populated when ever there is a new Unique displayuserMemberName(should be ID ideally), providerId and hotelID is available.
+- Concurrent File Processing: Both local and S3 file imports use a configurable thread pool for parallel processing.
+- Locking files: Used renaming files to .processing and then to .processed for supporting multi thread approach. If we stick to S3 as source, better option can be using metadata like tags we can use instead of file renaming, which can fail in edge cases.
+- Logging: used Log4j2 as standard logging, currently logging to console and file, with file rotation enabled. In production environment we can move these to cloud watch or any other log aggregators like DataDog or Splunk.
+- Unit testing:Core logic is covered by unit tests, with mocking for repositories and configuration.
+- Database: Added normalized tabled structure with required PK and FK for querying, added basic indexing, but based on data retrieval needs, we have to extend these.
+- System is written to extend in future either as background process service or api based system.
+- We can extend this to add Authentication and RBAC in future.ReviewSystems_Sample Outputs.docx
 
 ---
 
@@ -23,6 +48,10 @@ Review System Microservice that retrieves Agoda.com / Booking.com / Expedia revi
 - Maven
 - MySQL
 - (Optional) Docker
+
+### **2. Database Setup**
+
+- Deploy sschema.sql from resources folder.
 
 ### **2. Build the Project**
 
@@ -45,7 +74,7 @@ java -jar target/reviewsystem-0.0.1-SNAPSHOT.jar
 
 ```sh
 docker build -t reviewsystem:latest .
-docker run -p 8088:8088 \
+docker run -p 8089:8089 \
   -e SPRING_DATASOURCE_URL="jdbc:mysql://host:3306/db?useSSL=false" \
   -e SPRING_DATASOURCE_USERNAME="user" \
   -e SPRING_DATASOURCE_PASSWORD="pass" \
@@ -93,6 +122,24 @@ Import folder endpoint (same as above):
 curl -X POST http://localhost:8088/api/reviews/import-jl-folder
 ```
 
+Get reviews by-user
+
+```sh
+curl -X POST http://localhost:8089/api/reviews/by-user/<userID>
+```
+
+Get reviews by-hotel
+
+```sh
+curl -X POST http://localhost:8089/api/reviews/by-user/<hotelID>
+```
+
+Get overall review latest fpr provider by hoteID
+
+```sh
+curl -X POST http://localhost:8089/api/reviews/latest-overall-by-provider/<hotelID>
+```
+
 ### **Command Line**
 
 - Run with any argument to trigger import:
@@ -130,3 +177,8 @@ curl -X POST http://localhost:8088/api/reviews/import-jl-folder
 - Schema is extensible for new review fields, providers, or rating systems.
 
 ---
+
+## **CI/CD**
+
+- Added gitlab CI
+- This has stages for build, unit test, docker build, and docker deploy

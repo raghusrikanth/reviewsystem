@@ -1,5 +1,6 @@
 package com.reviewsystem.model;
 
+import com.fasterxml.jackson.annotation.JsonManagedReference;
 import jakarta.persistence.*;
 import lombok.*;
 import java.time.LocalDateTime;
@@ -62,6 +63,10 @@ public class Review {
     private String originalComment;
     private String formattedResponseDate;
     private Boolean isShowReviewResponse;
+
+    @OneToMany(mappedBy = "review", fetch = FetchType.LAZY)
+    @JsonManagedReference
+    private java.util.List<ReviewGrades> grades;
 
     @CreatedDate
     @Column(name = "created_at", updatable = false)

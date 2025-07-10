@@ -10,4 +10,5 @@ import org.springframework.stereotype.Component;
 public class JLImportFolderConfig {
     private String folderPath;
     private String tempDir;
+    private int concurrentThreads = 4;
 } 
